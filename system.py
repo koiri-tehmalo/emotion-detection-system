@@ -8,34 +8,43 @@ from datetime import datetime
 import os
 import pandas as pd
 from io import BytesIO
+import time
+
 app = Flask(__name__)
 
-# โหลดโมเดลการทำนายอารมณ์
 model = load_model('emotion_detection_model.h5')
 
-# MediaPipe Face Detection
 mp_face_detection = mp.solutions.face_detection
 face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.2)
 
-# ค่าทางสถิติ
-history = deque(maxlen=1200)  # เก็บข้อมูล 20 นาที (ถ้าตรวจจับทุกวินาที)
-time_history = deque(maxlen=1200)  # เก็บเวลาของการตรวจจับ
+history = deque(maxlen=1200)
+time_history = deque(maxlen=1200)
 face_count_history = deque(maxlen=1200)
 
 cap = cv2.VideoCapture(0)
 
+# ตัวแปรสะสมรายนาที
+minute_accumulator = {
+    "interested": 0,
+    "not_interested": 0,
+    "faces_each_second": [],
+    "last_logged_minute": ""
+}
+
 def detect_emotion():
+    global minute_accumulator
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = face_detection.process(frame_rgb)
         num_faces = 0
         interested_count = 0
         not_interested_count = 0
-        
+
         if results.detections:
             num_faces = len(results.detections)
             for detection in results.detections:
@@ -43,31 +52,54 @@ def detect_emotion():
                 ih, iw, _ = frame.shape
                 x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * ih)
                 face = frame[y:y+h, x:x+w]
-                
+
                 if face.size > 0:
                     img_gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
                     img_resized = cv2.resize(img_gray, (48, 48))
                     img_array = np.expand_dims(img_resized, axis=-1)
                     img_array = np.expand_dims(img_array, axis=0) / 255.0
-                    
+
                     predictions = model.predict(img_array)
                     predicted_class = np.argmax(predictions, axis=1)[0]
-                    
+
                     emotion_label = "Interested" if predicted_class == 0 else "Not Interested"
                     history.append(emotion_label)
                     time_history.append(datetime.now().strftime("%H:%M:%S"))
-                    
+
                     if predicted_class == 0:
                         interested_count += 1
                     else:
                         not_interested_count += 1
-                
+
                 color = (0, 255, 0) if emotion_label == "Interested" else (0, 0, 255)
                 cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
                 cv2.putText(frame, emotion_label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        
-        face_count_history.append((datetime.now().strftime("%H:%M:%S"), num_faces, interested_count, not_interested_count))
-        
+
+        # สะสมค่า
+        minute_accumulator["interested"] += interested_count
+        minute_accumulator["not_interested"] += not_interested_count
+        minute_accumulator["faces_each_second"].append(num_faces)
+
+        # ตรวจวินาทีแรกของแต่ละนาที
+        current_minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if current_minute != minute_accumulator["last_logged_minute"]:
+            minute_accumulator["last_logged_minute"] = current_minute
+            total = minute_accumulator["interested"] + minute_accumulator["not_interested"]
+            total = total if total > 0 else 1
+            percent_interested = round((minute_accumulator["interested"] / total) * 100, 2)
+            percent_not_interested = round((minute_accumulator["not_interested"] / total) * 100, 2)
+            avg_faces = round(np.mean(minute_accumulator["faces_each_second"])) if minute_accumulator["faces_each_second"] else 0
+
+            face_count_history.append((datetime.now().strftime("%H:%M:%S"),
+                                       avg_faces,
+                                       minute_accumulator["interested"],
+                                       minute_accumulator["not_interested"]))
+
+            # รีเซ็ต
+            minute_accumulator["interested"] = 0
+            minute_accumulator["not_interested"] = 0
+            minute_accumulator["faces_each_second"] = []
+
         _, buffer = cv2.imencode('.jpg', frame)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
